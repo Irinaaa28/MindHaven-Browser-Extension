@@ -12,7 +12,8 @@ In order to track the online activity from browsers, MindHaven has its own brows
 The main components of MindHaven Browser extension are:
 * manifest.json
 * background.js
-* content.js  
+* content.js
+  
 It also has popup.html, popup.js and styles.css for UI.
 
 ### manifest.json
