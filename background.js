@@ -3,8 +3,22 @@ let currentTabUrl = null;
 let currentCategory = null;
 let startTime = null;
 let scrollCount = 0;
+let currentUserUuid = null;
 
 console.log("MindHaven extension started");
+
+async function loadUserUuid() {
+    try {
+        const response = await fetch("http://localhost:8765/session");
+        const data = await response.json();
+        currentUserUuid = data.userUuid;
+        console.log("UUID loaded:", currentUserUuid);
+    } catch(error) {
+        console.error("Cannot load UUID", error);
+    }
+}
+
+loadUserUuid();
 
 chrome.tabs.onActivated.addListener(
     async (activeInfo) => {
@@ -84,6 +98,7 @@ async function sendBrowserActivity(url, category, durationSeconds, scrollCountVa
 {
     try {
         const body = {
+            userUuid: currentUserUuid,
             url: url,
             category: category,
             durationSeconds: durationSeconds,

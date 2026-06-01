@@ -3,6 +3,7 @@ let lastScrollY = window.scrollY;
 window.addEventListener(
     "scroll",
     () => {
+        console.log("SCROLL DETECTED");
         const currentScrollY = window.scrollY;
         const delta = Math.abs(currentScrollY - lastScrollY);
         lastScrollY = currentScrollY;
