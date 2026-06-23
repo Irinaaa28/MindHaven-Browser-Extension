@@ -41,22 +41,45 @@ chrome.tabs.onUpdated.addListener(
     }
 );
 
+let accumulatedSeconds = 0;
+
 function handleTabChange(tab)
 {
     if(!tab.url)
         return;
-    const now = Date.now();
-    if(currentTabUrl !== null)
+    const blockedPageUrl = chrome.runtime.getURL("blocked.html");
+    if (tab.url.startsWith(blockedPageUrl)) {
+        return; 
+    }
+    if(currentTabUrl !== null && accumulatedSeconds > 0)
     {
-        const durationSeconds = Math.floor((now - startTime)/1000);
         // send data to backend
-        sendBrowserActivity(currentTabUrl, "DETERMINED_BY_BACKEND", durationSeconds, scrollCount);
+        sendBrowserActivity(currentTabUrl, "DETERMINED_BY_BACKEND", accumulatedSeconds, scrollCount);
     }
     currentTabUrl = tab.url;
-    startTime = now;
+    startTime = Date.now();
     scrollCount = 0;
+    accumulatedSeconds = 0;
     console.log("Active URL:", currentTabUrl);
 }
+
+setInterval(async () => {
+    if (!currentUserUuid || currentTabUrl === null) return;
+    const blockedPageUrl = chrome.runtime.getURL("blocked.html");
+    if (currentTabUrl.startsWith(blockedPageUrl)) return;
+    const now = Date.now();
+    const deltaSeconds = Math.floor((now - startTime) / 1000);
+    if (deltaSeconds > 0) {
+        accumulatedSeconds += deltaSeconds;
+        startTime = now; 
+    }
+    if (accumulatedSeconds >= 30) {
+        console.log(`[Full Buffer] 30 seconds reached on ${currentTabUrl}. Sending data to backend.`);
+        sendBrowserActivity(currentTabUrl, "DETERMINED_BY_BACKEND", accumulatedSeconds, scrollCount);
+        accumulatedSeconds = 0;
+        scrollCount = 0;
+    }
+}, 10000);
 
 chrome.runtime.onMessage.addListener(
     (message) => {
@@ -100,13 +123,11 @@ async function sendBrowserActivity(url, category, durationSeconds, scrollCountVa
     }
 }
 
-// Funcție helper pentru izolarea domeniului pur (ex: youtube.com)
 function extractDomain(rawUrl) {
     try {
         const urlObj = new URL(rawUrl);
         let hostname = urlObj.hostname.toLowerCase();
         
-        // Eliminăm prefixul standard www. pentru a se potrivi cu baza de date
         if (hostname.startsWith("www.")) {
             hostname = hostname.substring(4);
         }
@@ -116,33 +137,23 @@ function extractDomain(rawUrl) {
     }
 }
 
-// Folosim onBeforeNavigate: se declanșează fix când utilizatorul apasă Enter sau dă click pe link
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
-    // 1. Ignorăm sub-frame-urile (iframe-uri din pagină, reclame etc.) ca să nu blocăm redundant
     if (details.frameId !== 0) return;
-
     const url = details.url;
-
-    // 2. IMPORTANT: Prevenim bucla infinită. Dacă URL-ul este deja pagina noastră locală de blocare, nu facem nimic
     if (url.startsWith('chrome-extension:')) return;
-
     const domain = extractDomain(url);
     if (!domain) return;
 
     try {
-        // 3. Preluăm UUID-ul stocat local în extensie
         const userUuid = currentUserUuid;
 
         if (!userUuid) {
-            console.warn("MindHaven: UUID-ul nu a fost găsit în storage. Trecere permisă.");
+            console.warn("MindHaven: UUID not loaded yet. Skipping backend evaluation.");
             return;
         }
 
-        console.log(`[PRE-NAVIGATE] Interceptat URL: ${url}. Verificăm domeniul: ${domain}`);
+        console.log(`[PRE-NAVIGATE] Intercepted URL: ${url}. Verifying domain: ${domain}`);
 
-        // 4. Trimitem cererea asincronă către backend (Spring Boot)
-        // Înainte ca această promisiune să fie rezolvată, browserul va încerca să încarce, 
-        // dar prin apelul rapid de mai jos vom suprascrie tabul înainte de randare.
         const response = await fetch(`http://localhost:8080/rules/evaluate/${userUuid}`, {
             method: "POST",
             headers: {
@@ -157,20 +168,59 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
             })
         });
 
-        if (!response.ok) throw new Error("Eroare la comunicarea cu serverul.");
+        if (!response.ok) throw new Error("Error communicating with the server.");
 
         const decision = await response.json();
 
-        // 5. Evaluăm decizia. Dacă este BLOCAT, schimbăm instant destinația tabului curent
         if (decision.blocked) {
-            console.log(`[BLOCAT] Redirecționare instantanee pentru tabul ${details.tabId} -> ${decision.reason}`);
-            
-            // Această comandă suprascrie navigarea aflată în curs de desfășurare în browser
+            console.log(`[BLOCKED] Instant redirect for tab ${details.tabId} -> ${decision.reason}`);
             chrome.tabs.update(details.tabId, {
                 url: chrome.runtime.getURL("blocked.html?reason=" + encodeURIComponent(decision.reason))
             });
         }
     } catch (error) {
-        console.error("Eroare în fluxul de pre-navigare:", error);
+        console.error("Error in pre-navigate flow:", error);
+    }
+});
+
+chrome.alarms.create("checkActiveTabRule", { periodInMinutes: 1 });
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name === "checkActiveTabRule" && currentUserUuid) {
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        
+        if (!activeTab || !activeTab.url) return;
+
+        const blockedPageUrl = chrome.runtime.getURL("blocked.html");
+        if (activeTab.url.startsWith(blockedPageUrl)) return;
+
+        try {
+            const urlObj = new URL(activeTab.url);
+            const domain = urlObj.hostname;
+
+            const response = await fetch(`http://localhost:8080/rules/evaluate/${currentUserUuid}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    userUuid: currentUserUuid,
+                    domain: domain,
+                    category: "DETERMINED_BY_BACKEND",
+                    currentTime: new Date().toTimeString().split(' ')[0],
+                    currentDate: new Date().toISOString().split('T')[0]
+                })
+            });
+
+            if (response.ok) {
+                const decision = await response.json();
+                if (decision.blocked) {
+                    console.log(`[Time Window] End time reached for ${domain}. Redirecting...`);
+                    chrome.tabs.update(activeTab.id, {
+                        url: chrome.runtime.getURL("blocked.html?reason=" + encodeURIComponent(decision.reason))
+                    });
+                }
+            }
+        } catch (error) {
+            console.error("Error checking time window rule:", error);
+        }
     }
 });
